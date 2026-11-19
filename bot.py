@@ -10,7 +10,7 @@ import unicodedata
 
 import discord
 from discord import app_commands
-from discord.ext import tasks
+from discord.ext import tasks  # noqa: F401  (für spätere Erweiterungen)
 
 from flags import COUNTRIES, EN_NAMES
 
@@ -25,17 +25,13 @@ log = logging.getLogger("flaggenquiz")
 
 # ======================= Einstellungen =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
-ROUNDS = 5                      # Flaggen pro Quiz
-INTERVAL_MINUTES = 5            # Pause zwischen dem Ende eines Quiz und dem nächsten automatischen Quiz
-ACTIVITY_WINDOW_MINUTES = 10    # So lange gilt der Kanal nach der letzten Nachricht als "aktiv"
-ROUND_TIMEOUT_MINUTES = 0       # 0 = unbegrenzt warten, bis jemand richtig antwortet (>0: Quiz endet nach X Min ohne Antwort)
-HINT_1_SECONDS = 60             # Erster Tipp (Anfangsbuchstabe + Länge) nach X Sekunden
-HINT_2_SECONDS = 120            # Zweiter Tipp (auch letzter Buchstabe) nach X Sekunden
-PAUSE_BETWEEN_ROUNDS = 4        # Sekunden Pause zwischen den Flaggen
-LEADERBOARD_SIZE = 10           # Plätze im Leaderboard
-XP_PER_FLAG = int(os.getenv("XP_PER_FLAG", 10))          # XP für richtige Antwort
-XP_QUIZ_WINNER = int(os.getenv("XP_QUIZ_WINNER", 20))    # Bonus-XP für den Quiz-Sieger
-XP_PER_LEVEL = 100              # XP pro Level
+LEADERBOARD_INTERVAL_MINUTES = 5  # Leaderboard höchstens alle X Minuten (nur wenn Flaggen beantwortet wurden)
+HINT_1_SECONDS = 60               # Erster Tipp (Anfangsbuchstabe + Länge) nach X Sekunden
+HINT_2_SECONDS = 120              # Zweiter Tipp (auch letzter Buchstabe) nach X Sekunden
+PAUSE_BETWEEN_FLAGS = 4           # Sekunden Pause nach einer gelösten Flagge
+LEADERBOARD_SIZE = 10             # Plätze im Leaderboard
+XP_PER_FLAG = int(os.getenv("XP_PER_FLAG", 10))  # XP für die richtige Antwort
+XP_PER_LEVEL = 100                # XP pro Level
 DB_FILE = "quiz.db"
 # =============================================================
 
@@ -50,17 +46,21 @@ COLOR_ERROR = discord.Color.from_rgb(231, 76, 60)
 db = sqlite3.connect(DB_FILE)
 db.execute(
     "CREATE TABLE IF NOT EXISTS config ("
-    "guild_id INTEGER PRIMARY KEY, channel_id INTEGER, last_run REAL DEFAULT 0)"
+    "guild_id INTEGER PRIMARY KEY, channel_id INTEGER, last_run REAL DEFAULT 0, active INTEGER DEFAULT 1)"
 )
 db.execute(
     "CREATE TABLE IF NOT EXISTS xp ("
     "guild_id INTEGER, user_id INTEGER, xp INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, "
     "PRIMARY KEY (guild_id, user_id))"
 )
-try:  # Migration für Datenbanken aus älteren Versionen
-    db.execute("ALTER TABLE xp ADD COLUMN correct INTEGER DEFAULT 0")
-except sqlite3.OperationalError:
-    pass
+for _migration in (  # Migrationen für Datenbanken aus älteren Versionen
+    "ALTER TABLE xp ADD COLUMN correct INTEGER DEFAULT 0",
+    "ALTER TABLE config ADD COLUMN active INTEGER DEFAULT 1",
+):
+    try:
+        db.execute(_migration)
+    except sqlite3.OperationalError:
+        pass
 db.commit()
 
 
@@ -70,6 +70,15 @@ def add_xp(guild_id: int, user_id: int, amount: int, correct: int = 0) -> None:
         "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
         "xp = xp + excluded.xp, correct = correct + excluded.correct",
         (guild_id, user_id, amount, correct),
+    )
+    db.commit()
+
+
+def save_channel(guild_id: int, channel_id: int) -> None:
+    db.execute(
+        "INSERT INTO config (guild_id, channel_id, active) VALUES (?, ?, 1) "
+        "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, active=1",
+        (guild_id, channel_id),
     )
     db.commit()
 
@@ -119,7 +128,7 @@ def make_hint(name: str, level: int) -> str:
     chars = []
     for i, c in enumerate(name):
         if not c.isalpha():
-            chars.append(c if c != " " else " ")
+            chars.append(c)
         elif i in reveal:
             chars.append(c)
         else:
@@ -131,10 +140,6 @@ def flag_emoji(code: str) -> str:
     if len(code) != 2:
         return "🏳️"
     return "".join(chr(0x1F1E6 + ord(c) - ord("a")) for c in code.lower())
-
-
-def progress_dots(current: int, total: int) -> str:
-    return "●" * current + "○" * (total - current)
 
 
 def bar(value: int, total: int, length: int = 10) -> str:
@@ -185,72 +190,72 @@ class QuizBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
-        self.running: dict[int, asyncio.Task] = {}  # guild_id -> laufende Quiz-Task
-        self.last_activity: dict[int, float] = {}   # channel_id -> Zeitpunkt der letzten Nachricht eines Users
-
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or message.guild is None:
-            return
-        self.last_activity[message.channel.id] = time.time()
+        self.running: dict[int, asyncio.Task] = {}  # guild_id -> Task der Dauer-Schleife
+        self.state: dict[int, dict] = {}            # guild_id -> Zähler für das Leaderboard
+        self._resumed = False
 
     async def setup_hook(self):
         # Befehle nur synchronisieren, wenn gewünscht (verhindert Rate-Limits bei jedem Start)
         if os.getenv("SYNC_COMMANDS") == "1":
             await self.tree.sync()
             log.info("Slash-Befehle synchronisiert")
-        self.scheduler.start()
 
-    @tasks.loop(seconds=30)
-    async def scheduler(self):
-        now = time.time()
-        rows = db.execute("SELECT guild_id, channel_id, last_run FROM config WHERE channel_id IS NOT NULL").fetchall()
-        for guild_id, channel_id, last_run in rows:
-            try:
-                if now - last_run >= INTERVAL_MINUTES * 60 and guild_id not in self.running:
-                    channel = self.get_channel(channel_id)
-                    if channel is None:
-                        continue
-                    # Nur starten, wenn im Kanal zuletzt jemand geschrieben hat
-                    last_msg = self.last_activity.get(channel_id, 0)
-                    if now - last_msg > ACTIVITY_WINDOW_MINUTES * 60:
-                        continue
-                    db.execute("UPDATE config SET last_run=? WHERE guild_id=?", (now, guild_id))
-                    db.commit()
-                    asyncio.create_task(self.run_quiz(channel))
-            except Exception:
-                log.exception("Fehler im Scheduler (Server %s)", guild_id)
+    async def on_ready(self):
+        log.info("Eingeloggt als %s (%d Länder im Quiz)", self.user, len(COUNTRIES))
+        if self._resumed:
+            return
+        self._resumed = True
+        # Nach einem Neustart laufen die Quizze in den gespeicherten Kanälen automatisch weiter
+        rows = db.execute("SELECT guild_id, channel_id FROM config WHERE active=1 AND channel_id IS NOT NULL").fetchall()
+        for guild_id, channel_id in rows:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                log.warning("Kanal %s (Server %s) nicht gefunden", channel_id, guild_id)
+                continue
+            self.start_loop(channel, announce=False)
+            log.info("Quiz in Server %s fortgesetzt", guild_id)
 
-    @scheduler.before_loop
-    async def before_scheduler(self):
-        await self.wait_until_ready()
+    # ---------- Dauer-Schleife ----------
+    def start_loop(self, channel: discord.TextChannel, announce: bool) -> asyncio.Task:
+        gid = channel.guild.id
+        old = self.running.get(gid)
+        if old:
+            old.cancel()
+        st = {"channel": channel, "answered": 0, "last_board": time.time()}
+        self.state[gid] = st
+        task = asyncio.create_task(self.run_loop(channel, st, announce))
+        self.running[gid] = task
+        return task
+
+    def stop_loop(self, guild_id: int) -> bool:
+        task = self.running.pop(guild_id, None)
+        self.state.pop(guild_id, None)
+        if task:
+            task.cancel()
+            return True
+        return False
 
     async def wait_for_answer(self, channel, name: str, answers: list[str]):
-        """Wartet auf die richtige Antwort. Zeigt nach und nach Tipps an. Gibt None bei Timeout zurück."""
+        """Wartet unbegrenzt auf die richtige Antwort und zeigt nach und nach Tipps an."""
         loop = asyncio.get_running_loop()
         start = loop.time()
-        deadline = start + ROUND_TIMEOUT_MINUTES * 60 if ROUND_TIMEOUT_MINUTES > 0 else None
         hints = [(HINT_1_SECONDS, 1), (HINT_2_SECONDS, 2)]
         next_hint = 0
         while True:
-            now = loop.time()
-            if deadline is not None and now >= deadline:
-                return None
-            wait = None if deadline is None else deadline - now  # None = unbegrenzt warten
+            wait = None
             if next_hint < len(hints):
-                until_hint = start + hints[next_hint][0] - now
-                wait = until_hint if wait is None else min(wait, until_hint)
+                wait = max(start + hints[next_hint][0] - loop.time(), 0.1)
             try:
                 msg = await self.wait_for(
                     "message",
                     check=lambda m: m.channel.id == channel.id and not m.author.bot,
-                    timeout=None if wait is None else max(wait, 0.1),
+                    timeout=wait,
                 )
             except asyncio.TimeoutError:
                 if next_hint < len(hints) and loop.time() >= start + hints[next_hint][0]:
-                    level = hints[next_hint][1]
                     await channel.send(embed=discord.Embed(
                         title="💡 Tipp",
-                        description=f"`{make_hint(name, level)}`",
+                        description=f"`{make_hint(name, hints[next_hint][1])}`",
                         color=COLOR_WARN,
                     ))
                     next_hint += 1
@@ -258,144 +263,107 @@ class QuizBot(discord.Client):
             if is_correct(msg.content, answers):
                 return msg
 
-    async def run_quiz(self, channel: discord.TextChannel) -> bool:
+    async def run_loop(self, channel: discord.TextChannel, st: dict, announce: bool):
         gid = channel.guild.id
-        if gid in self.running:
-            return False
-        self.running[gid] = asyncio.current_task()
+        bag: list = []
+        number = 0
         try:
-            await self._play(channel)
-            return True
+            if announce:
+                intro = discord.Embed(
+                    title="🌍 Flaggen-Quiz",
+                    description=(
+                        "Ab jetzt läuft das Flaggen-Quiz dauerhaft.\n"
+                        "Schreibe den Ländernamen in den Chat – **Deutsch oder English**. "
+                        "Die nächste Flagge kommt erst, wenn die aktuelle erraten wurde."
+                    ),
+                    color=COLOR_PRIMARY,
+                )
+                intro.add_field(name="Pro Flagge", value=f"+{XP_PER_FLAG} XP", inline=True)
+                intro.add_field(name="Leaderboard", value=f"alle {LEADERBOARD_INTERVAL_MINUTES} Min bei Aktivität", inline=True)
+                await channel.send(embed=intro)
+                await asyncio.sleep(3)
+
+            while True:
+                if not bag:  # alle Länder einmal durchmischen, damit sich nichts wiederholt
+                    bag = COUNTRIES[:]
+                    random.shuffle(bag)
+                code, name, aliases = bag.pop()
+                number += 1
+                try:
+                    await self._ask(channel, st, number, code, name, aliases)
+                except asyncio.CancelledError:
+                    raise
+                except discord.NotFound:
+                    log.warning("Kanal %s existiert nicht mehr – Quiz in Server %s beendet", channel.id, gid)
+                    db.execute("UPDATE config SET active=0 WHERE guild_id=?", (gid,))
+                    db.commit()
+                    return
+                except discord.HTTPException as e:
+                    log.warning("Discord-Fehler im Server %s: %s – neuer Versuch in 30 s", gid, e)
+                    await asyncio.sleep(30)
+                except Exception:
+                    log.exception("Fehler im Quiz (Server %s) – weiter in 10 s", gid)
+                    await asyncio.sleep(10)
         except asyncio.CancelledError:
-            await channel.send(embed=info_embed("Das Quiz wurde von einem Admin abgebrochen.", COLOR_ERROR, "🛑 Quiz abgebrochen"))
-            return False
-        except discord.Forbidden:
-            log.warning("Fehlende Rechte im Kanal %s (Server %s)", channel.id, gid)
-            return False
-        except Exception:
-            log.exception("Quiz in Server %s fehlgeschlagen", gid)
-            return False
+            pass
         finally:
-            self.running.pop(gid, None)
-            # Die Pause bis zum nächsten Quiz beginnt erst, wenn dieses Quiz zu Ende ist
-            db.execute("UPDATE config SET last_run=? WHERE guild_id=?", (time.time(), gid))
-            db.commit()
+            if self.running.get(gid) is asyncio.current_task():
+                self.running.pop(gid, None)
+                self.state.pop(gid, None)
 
-    async def _play(self, channel: discord.TextChannel):
+    async def _ask(self, channel: discord.TextChannel, st: dict, number: int, code: str, name: str, aliases: list[str]):
         gid = channel.guild.id
-        scores: dict[int, int] = {}
-        picks = random.sample(COUNTRIES, ROUNDS)
+        answers = country_answers(code, name, aliases)
+        english = EN_NAMES.get(code, [name])[0]
 
-        intro = discord.Embed(
-            title="🌍 Flaggen-Quiz",
-            description=(
-                "Erkenne die Flagge und schreibe den Ländernamen in den Chat – **Deutsch oder English**.\n"
-                "Wer zuerst richtig liegt, gewinnt die Runde."
-            ),
+        question = discord.Embed(
+            title="Welche Flagge ist das?",
+            description=f"Flagge **#{number}**",
             color=COLOR_PRIMARY,
         )
-        intro.add_field(name="Runden", value=f"{ROUNDS} Flaggen", inline=True)
-        intro.add_field(name="Pro Flagge", value=f"+{XP_PER_FLAG} XP", inline=True)
-        intro.add_field(name="Quiz-Sieger", value=f"+{XP_QUIZ_WINNER} XP", inline=True)
-        intro.set_footer(text="Die nächste Flagge erscheint, sobald die aktuelle gelöst wurde  ·  Los geht's gleich …")
-        await channel.send(embed=intro)
-        await asyncio.sleep(5)
+        question.set_image(url=f"https://flagcdn.com/w640/{code}.png")
+        question.set_footer(text="Schreibe den Ländernamen (Deutsch oder English) in den Chat")
+        await channel.send(embed=question)
 
-        for i, (code, name, aliases) in enumerate(picks, 1):
-            answers = country_answers(code, name, aliases)
-            english = EN_NAMES.get(code, [name])[0]
+        started = time.monotonic()
+        msg = await self.wait_for_answer(channel, name, answers)
+        took = time.monotonic() - started
 
-            question = discord.Embed(
-                title="Welche Flagge ist das?",
-                description=f"`{progress_dots(i, ROUNDS)}`  Runde **{i}** von **{ROUNDS}**",
-                color=COLOR_PRIMARY,
-            )
-            question.set_image(url=f"https://flagcdn.com/w640/{code}.png")
-            question.set_footer(text="Schreibe den Ländernamen (Deutsch oder English) in den Chat")
-            await channel.send(embed=question)
+        add_xp(gid, msg.author.id, XP_PER_FLAG, correct=1)
+        st["answered"] += 1
+        try:
+            await msg.add_reaction("✅")
+        except discord.HTTPException:
+            pass
 
-            started = time.monotonic()
-            msg = await self.wait_for_answer(channel, name, answers)
-
-            if msg is None:
-                await channel.send(embed=discord.Embed(
-                    title=f"⏰ Niemand hat geantwortet",
-                    description=(
-                        f"Die Antwort war **{flag_emoji(code)} {name}**.\n"
-                        f"Seit {ROUND_TIMEOUT_MINUTES} Minuten gab es keine richtige Antwort – das Quiz wird beendet."
-                    ),
-                    color=COLOR_MUTED,
-                ))
-                break
-
-            took = time.monotonic() - started
-            add_xp(gid, msg.author.id, XP_PER_FLAG, correct=1)
-            scores[msg.author.id] = scores.get(msg.author.id, 0) + 1
-            try:
-                await msg.add_reaction("✅")
-            except discord.HTTPException:
-                pass
-
-            result = discord.Embed(
-                title=f"{flag_emoji(code)} {name}",
-                description=f"✅ **{msg.author.display_name}** hat die Flagge erraten!",
-                color=COLOR_SUCCESS,
-            )
-            result.add_field(name="English", value=english, inline=True)
-            result.add_field(name="Belohnung", value=f"+{XP_PER_FLAG} XP", inline=True)
-            result.add_field(name="Zeit", value=f"{took:.1f} s", inline=True)
-            result.set_thumbnail(url=msg.author.display_avatar.url)
-            result.set_footer(text=f"Runde {i} von {ROUNDS}")
-            await channel.send(embed=result)
-
-            if i < ROUNDS:
-                await asyncio.sleep(PAUSE_BETWEEN_ROUNDS)
-
-        # ---- Auswertung + Leaderboard ----
-        embeds = []
-        if scores:
-            ranking = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            top = ranking[0][1]
-            winners = [uid for uid, s in ranking if s == top]
-            for uid in winners:
-                add_xp(gid, uid, XP_QUIZ_WINNER)
-
-            lines = [
-                f"{rank_label(n)} <@{uid}>  ·  **{s}** richtig"
-                for n, (uid, s) in enumerate(ranking)
-            ]
-            summary = discord.Embed(title="🏁 Quiz beendet – Ergebnis", description="\n".join(lines), color=COLOR_GOLD)
-            summary.add_field(
-                name="🏆 Quiz-Sieger",
-                value=", ".join(f"<@{u}>" for u in winners) + f"  ·  +{XP_QUIZ_WINNER} Bonus-XP",
-                inline=False,
-            )
-        else:
-            summary = discord.Embed(
-                title="🏁 Quiz beendet",
-                description="Diesmal hat niemand eine Flagge erraten. Beim nächsten Mal klappt's bestimmt!",
-                color=COLOR_MUTED,
-            )
-
-        next_run = int(time.time() + INTERVAL_MINUTES * 60)
-        summary.add_field(
-            name="Nächstes Quiz",
-            value=f"Frühestens <t:{next_run}:R> – sobald im Kanal etwas los ist",
-            inline=False,
+        result = discord.Embed(
+            title=f"{flag_emoji(code)} {name}",
+            description=f"✅ **{msg.author.display_name}** hat die Flagge erraten!",
+            color=COLOR_SUCCESS,
         )
-        embeds.append(summary)
+        result.add_field(name="English", value=english, inline=True)
+        result.add_field(name="Belohnung", value=f"+{XP_PER_FLAG} XP", inline=True)
+        result.add_field(name="Zeit", value=f"{took:.1f} s", inline=True)
+        result.set_thumbnail(url=msg.author.display_avatar.url)
+        result.set_footer(text=f"Flagge #{number}")
+        await channel.send(embed=result)
 
-        board = leaderboard_embed(gid)
-        if board:
-            embeds.append(board)
-        await channel.send(embeds=embeds)
+        # Leaderboard: höchstens alle X Minuten und nur, wenn Flaggen beantwortet wurden
+        if st["answered"] > 0 and time.time() - st["last_board"] >= LEADERBOARD_INTERVAL_MINUTES * 60:
+            board = leaderboard_embed(gid)
+            st["answered"] = 0
+            st["last_board"] = time.time()
+            if board:
+                await channel.send(embed=board)
+
+        await asyncio.sleep(PAUSE_BETWEEN_FLAGS)
 
 
 bot = QuizBot()
 
 
 # ----------------------- Slash-Befehle -----------------------
-@bot.tree.command(name="quiz_kanal", description="Legt den Kanal für das Flaggen-Quiz fest")
+@bot.tree.command(name="quiz_kanal", description="Legt den Kanal fest und startet dort das dauerhafte Flaggen-Quiz")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def quiz_kanal(interaction: discord.Interaction, kanal: discord.TextChannel):
@@ -409,61 +377,58 @@ async def quiz_kanal(interaction: discord.Interaction, kanal: discord.TextChanne
             ephemeral=True,
         )
         return
-    db.execute(
-        "INSERT INTO config (guild_id, channel_id, last_run) VALUES (?, ?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id",
-        (interaction.guild_id, kanal.id, time.time()),
-    )
-    db.commit()
+    save_channel(interaction.guild_id, kanal.id)
+    bot.start_loop(kanal, announce=True)
     await interaction.response.send_message(
         embed=info_embed(
-            f"In {kanal.mention} startet automatisch ein neues Quiz, sobald die letzte Runde "
-            f"**{INTERVAL_MINUTES} Minuten** her ist und im Kanal etwas los ist.\n"
-            f"Mit `/quiz_start` startest du sofort eine Runde.",
+            f"Das Flaggen-Quiz läuft jetzt dauerhaft in {kanal.mention}.\n"
+            f"Pause mit `/quiz_stop`, weiter mit `/quiz_start`.",
             COLOR_SUCCESS, "✅ Kanal gespeichert",
         ),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="quiz_start", description="Startet sofort ein Flaggen-Quiz")
+@bot.tree.command(name="quiz_start", description="Startet das dauerhafte Flaggen-Quiz")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def quiz_start(interaction: discord.Interaction):
     if interaction.guild_id in bot.running:
         await interaction.response.send_message(
-            embed=info_embed("Es läuft bereits ein Quiz.", COLOR_WARN), ephemeral=True
+            embed=info_embed("Das Quiz läuft bereits.", COLOR_WARN), ephemeral=True
         )
         return
     row = db.execute("SELECT channel_id FROM config WHERE guild_id=?", (interaction.guild_id,)).fetchone()
     channel = (bot.get_channel(row[0]) if row and row[0] else None) or interaction.channel
-    db.execute(
-        "INSERT INTO config (guild_id, channel_id, last_run) VALUES (?, ?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET last_run=excluded.last_run",
-        (interaction.guild_id, channel.id, time.time()),
-    )
-    db.commit()
+    save_channel(interaction.guild_id, channel.id)
     await interaction.response.send_message(
         embed=info_embed(f"Das Quiz startet in {channel.mention}.", COLOR_SUCCESS, "🚀 Quiz gestartet"),
         ephemeral=True,
     )
-    asyncio.create_task(bot.run_quiz(channel))
+    bot.start_loop(channel, announce=True)
 
 
-@bot.tree.command(name="quiz_stop", description="Bricht das laufende Flaggen-Quiz ab")
+@bot.tree.command(name="quiz_stop", description="Stoppt das Flaggen-Quiz")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def quiz_stop(interaction: discord.Interaction):
-    task = bot.running.get(interaction.guild_id)
-    if not task:
+    st = bot.state.get(interaction.guild_id)
+    channel = st["channel"] if st else None
+    if not bot.stop_loop(interaction.guild_id):
         await interaction.response.send_message(
             embed=info_embed("Es läuft gerade kein Quiz.", COLOR_WARN), ephemeral=True
         )
         return
-    task.cancel()
+    db.execute("UPDATE config SET active=0 WHERE guild_id=?", (interaction.guild_id,))
+    db.commit()
     await interaction.response.send_message(
-        embed=info_embed("Das Quiz wird abgebrochen …", COLOR_ERROR), ephemeral=True
+        embed=info_embed("Das Quiz wurde gestoppt. Mit `/quiz_start` geht es weiter.", COLOR_ERROR), ephemeral=True
     )
+    if channel:
+        try:
+            await channel.send(embed=info_embed("Das Flaggen-Quiz wurde von einem Admin gestoppt.", COLOR_ERROR, "🛑 Quiz gestoppt"))
+        except discord.HTTPException:
+            pass
 
 
 @bot.tree.command(name="leaderboard", description="Zeigt die Top 10 der Schlausten")
@@ -506,11 +471,6 @@ async def rang(interaction: discord.Interaction, nutzer: discord.Member | None =
         inline=False,
     )
     await interaction.response.send_message(embed=embed)
-
-
-@bot.event
-async def on_ready():
-    log.info("Eingeloggt als %s (%d Länder im Quiz)", bot.user, len(COUNTRIES))
 
 
 if __name__ == "__main__":
