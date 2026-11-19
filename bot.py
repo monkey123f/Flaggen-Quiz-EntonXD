@@ -26,7 +26,8 @@ log = logging.getLogger("flaggenquiz")
 # ======================= Einstellungen =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
 ROUNDS = 5                      # Flaggen pro Quiz
-INTERVAL_HOURS = 12             # Abstand zwischen automatischen Quizzen
+INTERVAL_MINUTES = 5            # Pause zwischen dem Ende eines Quiz und dem nächsten automatischen Quiz
+ACTIVITY_WINDOW_MINUTES = 10    # So lange gilt der Kanal nach der letzten Nachricht als "aktiv"
 ROUND_TIMEOUT_MINUTES = 30      # Sicherheit: Quiz endet, wenn so lange niemand antwortet
 HINT_1_SECONDS = 60             # Erster Tipp (Anfangsbuchstabe + Länge) nach X Sekunden
 HINT_2_SECONDS = 120            # Zweiter Tipp (auch letzter Buchstabe) nach X Sekunden
@@ -185,6 +186,12 @@ class QuizBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
         self.running: dict[int, asyncio.Task] = {}  # guild_id -> laufende Quiz-Task
+        self.last_activity: dict[int, float] = {}   # channel_id -> Zeitpunkt der letzten Nachricht eines Users
+
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+        self.last_activity[message.channel.id] = time.time()
 
     async def setup_hook(self):
         # Befehle nur synchronisieren, wenn gewünscht (verhindert Rate-Limits bei jedem Start)
@@ -193,15 +200,19 @@ class QuizBot(discord.Client):
             log.info("Slash-Befehle synchronisiert")
         self.scheduler.start()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(seconds=30)
     async def scheduler(self):
         now = time.time()
         rows = db.execute("SELECT guild_id, channel_id, last_run FROM config WHERE channel_id IS NOT NULL").fetchall()
         for guild_id, channel_id, last_run in rows:
             try:
-                if now - last_run >= INTERVAL_HOURS * 3600 and guild_id not in self.running:
+                if now - last_run >= INTERVAL_MINUTES * 60 and guild_id not in self.running:
                     channel = self.get_channel(channel_id)
                     if channel is None:
+                        continue
+                    # Nur starten, wenn im Kanal zuletzt jemand geschrieben hat
+                    last_msg = self.last_activity.get(channel_id, 0)
+                    if now - last_msg > ACTIVITY_WINDOW_MINUTES * 60:
                         continue
                     db.execute("UPDATE config SET last_run=? WHERE guild_id=?", (now, guild_id))
                     db.commit()
@@ -265,6 +276,9 @@ class QuizBot(discord.Client):
             return False
         finally:
             self.running.pop(gid, None)
+            # Die Pause bis zum nächsten Quiz beginnt erst, wenn dieses Quiz zu Ende ist
+            db.execute("UPDATE config SET last_run=? WHERE guild_id=?", (time.time(), gid))
+            db.commit()
 
     async def _play(self, channel: discord.TextChannel):
         gid = channel.guild.id
@@ -362,10 +376,12 @@ class QuizBot(discord.Client):
                 color=COLOR_MUTED,
             )
 
-        row = db.execute("SELECT last_run FROM config WHERE guild_id=?", (gid,)).fetchone()
-        if row and row[0]:
-            next_run = int(row[0] + INTERVAL_HOURS * 3600)
-            summary.add_field(name="Nächstes Quiz", value=f"<t:{next_run}:R>", inline=False)
+        next_run = int(time.time() + INTERVAL_MINUTES * 60)
+        summary.add_field(
+            name="Nächstes Quiz",
+            value=f"Frühestens <t:{next_run}:R> – sobald im Kanal etwas los ist",
+            inline=False,
+        )
         embeds.append(summary)
 
         board = leaderboard_embed(gid)
@@ -400,7 +416,8 @@ async def quiz_kanal(interaction: discord.Interaction, kanal: discord.TextChanne
     db.commit()
     await interaction.response.send_message(
         embed=info_embed(
-            f"Das Quiz läuft jetzt alle **{INTERVAL_HOURS} Stunden** in {kanal.mention}.\n"
+            f"In {kanal.mention} startet automatisch ein neues Quiz, sobald die letzte Runde "
+            f"**{INTERVAL_MINUTES} Minuten** her ist und im Kanal etwas los ist.\n"
             f"Mit `/quiz_start` startest du sofort eine Runde.",
             COLOR_SUCCESS, "✅ Kanal gespeichert",
         ),
