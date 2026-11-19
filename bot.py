@@ -28,7 +28,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 ROUNDS = 5                      # Flaggen pro Quiz
 INTERVAL_MINUTES = 5            # Pause zwischen dem Ende eines Quiz und dem nächsten automatischen Quiz
 ACTIVITY_WINDOW_MINUTES = 10    # So lange gilt der Kanal nach der letzten Nachricht als "aktiv"
-ROUND_TIMEOUT_MINUTES = 30      # Sicherheit: Quiz endet, wenn so lange niemand antwortet
+ROUND_TIMEOUT_MINUTES = 0       # 0 = unbegrenzt warten, bis jemand richtig antwortet (>0: Quiz endet nach X Min ohne Antwort)
 HINT_1_SECONDS = 60             # Erster Tipp (Anfangsbuchstabe + Länge) nach X Sekunden
 HINT_2_SECONDS = 120            # Zweiter Tipp (auch letzter Buchstabe) nach X Sekunden
 PAUSE_BETWEEN_ROUNDS = 4        # Sekunden Pause zwischen den Flaggen
@@ -228,21 +228,22 @@ class QuizBot(discord.Client):
         """Wartet auf die richtige Antwort. Zeigt nach und nach Tipps an. Gibt None bei Timeout zurück."""
         loop = asyncio.get_running_loop()
         start = loop.time()
-        deadline = start + ROUND_TIMEOUT_MINUTES * 60
+        deadline = start + ROUND_TIMEOUT_MINUTES * 60 if ROUND_TIMEOUT_MINUTES > 0 else None
         hints = [(HINT_1_SECONDS, 1), (HINT_2_SECONDS, 2)]
         next_hint = 0
         while True:
             now = loop.time()
-            if now >= deadline:
+            if deadline is not None and now >= deadline:
                 return None
-            wait = deadline - now
+            wait = None if deadline is None else deadline - now  # None = unbegrenzt warten
             if next_hint < len(hints):
-                wait = min(wait, start + hints[next_hint][0] - now)
+                until_hint = start + hints[next_hint][0] - now
+                wait = until_hint if wait is None else min(wait, until_hint)
             try:
                 msg = await self.wait_for(
                     "message",
                     check=lambda m: m.channel.id == channel.id and not m.author.bot,
-                    timeout=max(wait, 0.1),
+                    timeout=None if wait is None else max(wait, 0.1),
                 )
             except asyncio.TimeoutError:
                 if next_hint < len(hints) and loop.time() >= start + hints[next_hint][0]:
