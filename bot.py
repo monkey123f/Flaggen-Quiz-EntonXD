@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from flags import COUNTRIES
+from flags import COUNTRIES, EN_NAMES
 
 try:
     from dotenv import load_dotenv
@@ -83,17 +83,31 @@ def normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text)
 
 
+def country_answers(code: str, name: str, aliases: list[str]) -> list[str]:
+    """Alle akzeptierten Antworten (Deutsch + Englisch), normalisiert."""
+    names = [name] + list(aliases) + EN_NAMES.get(code, [])
+    return list({normalize(n) for n in names})
+
+
+# Alle gültigen Ländernamen – damit z. B. "Austria" nie als Tippfehler von "Australia" durchgeht
+ALL_NAMES = set()
+for _code, _name, _aliases in COUNTRIES:
+    ALL_NAMES.update(country_answers(_code, _name, _aliases))
+
+
 def is_correct(guess: str, answers: list[str]) -> bool:
     g = normalize(guess)
     if not g:
         return False
-    for a in answers:
-        if g == a:
-            return True
-        # kleine Tippfehler erlauben (nur bei längeren Namen)
-        if len(a) >= 6 and difflib.SequenceMatcher(None, g, a).ratio() >= 0.88:
-            return True
-    return False
+    if g in answers:
+        return True
+    if g in ALL_NAMES:  # ein anderes, gültiges Land -> falsch
+        return False
+    # kleine Tippfehler erlauben (nur bei längeren Namen)
+    return any(
+        len(a) >= 6 and difflib.SequenceMatcher(None, g, a).ratio() >= 0.9
+        for a in answers
+    )
 
 
 def make_hint(name: str, level: int) -> str:
@@ -260,7 +274,7 @@ class QuizBot(discord.Client):
         intro = discord.Embed(
             title="🌍 Flaggen-Quiz",
             description=(
-                "Erkenne die Flagge und schreibe den Ländernamen in den Chat.\n"
+                "Erkenne die Flagge und schreibe den Ländernamen in den Chat – **Deutsch oder English**.\n"
                 "Wer zuerst richtig liegt, gewinnt die Runde."
             ),
             color=COLOR_PRIMARY,
@@ -273,7 +287,8 @@ class QuizBot(discord.Client):
         await asyncio.sleep(5)
 
         for i, (code, name, aliases) in enumerate(picks, 1):
-            answers = [normalize(name)] + [normalize(a) for a in aliases]
+            answers = country_answers(code, name, aliases)
+            english = EN_NAMES.get(code, [name])[0]
 
             question = discord.Embed(
                 title="Welche Flagge ist das?",
@@ -281,7 +296,7 @@ class QuizBot(discord.Client):
                 color=COLOR_PRIMARY,
             )
             question.set_image(url=f"https://flagcdn.com/w640/{code}.png")
-            question.set_footer(text="Schreibe den Ländernamen in den Chat")
+            question.set_footer(text="Schreibe den Ländernamen (Deutsch oder English) in den Chat")
             await channel.send(embed=question)
 
             started = time.monotonic()
@@ -311,6 +326,7 @@ class QuizBot(discord.Client):
                 description=f"✅ **{msg.author.display_name}** hat die Flagge erraten!",
                 color=COLOR_SUCCESS,
             )
+            result.add_field(name="English", value=english, inline=True)
             result.add_field(name="Belohnung", value=f"+{XP_PER_FLAG} XP", inline=True)
             result.add_field(name="Zeit", value=f"{took:.1f} s", inline=True)
             result.set_thumbnail(url=msg.author.display_avatar.url)
