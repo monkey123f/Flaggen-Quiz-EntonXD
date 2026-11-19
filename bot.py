@@ -23,7 +23,7 @@ except ImportError:
 TOKEN = os.getenv("DISCORD_TOKEN")
 ROUNDS = 5                                   # Flaggen pro Quiz
 INTERVAL_HOURS = 12                          # Abstand zwischen Quizzen
-ROUND_SECONDS = 20                           # Zeit pro Flagge
+ROUND_TIMEOUT_MINUTES = 30                   # Sicherheit: Quiz endet, wenn so lange niemand antwortet
 XP_PER_FLAG = int(os.getenv("XP_PER_FLAG", 10))      # XP für richtige Antwort
 XP_QUIZ_WINNER = int(os.getenv("XP_QUIZ_WINNER", 20))  # Bonus für Gesamtsieger
 DB_FILE = "quiz.db"
@@ -74,7 +74,7 @@ class QuizBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.running = set()
+        self.running = {}  # guild_id -> laufende Quiz-Task
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -99,7 +99,7 @@ class QuizBot(discord.Client):
 
     async def wait_for_answer(self, channel, answers):
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + ROUND_SECONDS
+        deadline = loop.time() + ROUND_TIMEOUT_MINUTES * 60
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -119,14 +119,14 @@ class QuizBot(discord.Client):
         gid = channel.guild.id
         if gid in self.running:
             return False
-        self.running.add(gid)
+        self.running[gid] = asyncio.current_task()
         try:
             scores = {}
             picks = random.sample(COUNTRIES, ROUNDS)
             await channel.send(embed=discord.Embed(
                 title="🌍 Flaggen-Quiz startet!",
                 description=(
-                    f"**{ROUNDS} Flaggen**, je **{ROUND_SECONDS} Sekunden**.\n"
+                    f"**{ROUNDS} Flaggen** – die nächste kommt erst, wenn die aktuelle erraten wurde.\n"
                     f"Wer als Erstes richtig antwortet, bekommt **{XP_PER_FLAG} XP**.\n"
                     f"Schreib einfach den Ländernamen in den Chat!"
                 ),
@@ -141,7 +141,7 @@ class QuizBot(discord.Client):
                     color=discord.Color.gold(),
                 )
                 embed.set_image(url=f"https://flagcdn.com/w640/{code}.png")
-                embed.set_footer(text=f"Du hast {ROUND_SECONDS} Sekunden Zeit")
+                embed.set_footer(text="Schreib den Ländernamen in den Chat")
                 await channel.send(embed=embed)
 
                 msg = await self.wait_for_answer(channel, answers)
@@ -151,8 +151,12 @@ class QuizBot(discord.Client):
                     await msg.add_reaction("✅")
                     await channel.send(f"🎉 {msg.author.mention} hat es erraten: **{name}**! (+{XP_PER_FLAG} XP)")
                 else:
-                    await channel.send(f"⏰ Zeit abgelaufen! Die Antwort war **{name}**.")
-                await asyncio.sleep(4)
+                    await channel.send(
+                        f"⏰ Seit {ROUND_TIMEOUT_MINUTES} Minuten hat niemand geantwortet. "
+                        f"Die Antwort war **{name}**. Das Quiz wird beendet."
+                    )
+                    break
+                await asyncio.sleep(3)
 
             # Zusammenfassung
             if not scores:
@@ -175,8 +179,11 @@ class QuizBot(discord.Client):
             embed.set_footer(text="Nutze /leaderboard für die Gesamtwertung")
             await channel.send(embed=embed)
             return True
+        except asyncio.CancelledError:
+            await channel.send("🛑 Das Quiz wurde abgebrochen.")
+            return False
         finally:
-            self.running.discard(gid)
+            self.running.pop(gid, None)
 
 
 bot = QuizBot()
@@ -216,6 +223,18 @@ async def quiz_start(interaction: discord.Interaction):
     )
     db.commit()
     asyncio.create_task(bot.run_quiz(channel))
+
+
+@bot.tree.command(name="quiz_stop", description="Bricht das laufende Flaggen-Quiz ab")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def quiz_stop(interaction: discord.Interaction):
+    task = bot.running.get(interaction.guild_id)
+    if not task:
+        await interaction.response.send_message("Es läuft gerade kein Quiz.", ephemeral=True)
+        return
+    task.cancel()
+    await interaction.response.send_message("Quiz wird abgebrochen…", ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="Zeigt die Top 10 der Schlausten")
